@@ -1,0 +1,39 @@
+# core functionality
+feedparser==6.0.10
+requests==2.31.0
+pydub==0.25.1
+
+ffmpeg-python==0.2.0
+soundfile==0.12.1
+
+# database
+
+
+# OpenAI
+openai==1.23.2
+
+# scientific stack (compatible with pyannote + scipy)
+numpy==1.24.4
+scipy==1.10.1
+
+# PyTorch CPU build
+# (install these with `--index-url https://download.pytorch.org/whl/cpu`)
+torch==2.0.0+cpu
+torchaudio==2.0.1+cpu
+
+# transformer models for alignment
+transformers==4.32.1
+datasets==2.13.1
+sentencepiece==0.1.99
+
+# faster-whisper (must be 0.6.0 for whisperx v3.1.1)
+faster-whisper==0.6.0
+
+# whisperx from GitHub (v3.1.1 includes diarization + alignment support)
+whisperx @ git+https://github.com/m-bain/whisperx.git@v3.1.1
+
+fastapi
+uvicorn[standard]
+python-dotenv
+SQLAlchemy
+psycopg2-binary

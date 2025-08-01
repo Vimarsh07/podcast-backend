@@ -1,0 +1,15 @@
+# Python virtualenv
+venv/
+.venv/
+
+# Bytecode & caches
+__pycache__/
+*.py[cod]
+
+# Environment files
+.env
+episodes.db
+
+# Editor folders
+.vscode/
+.idea/
