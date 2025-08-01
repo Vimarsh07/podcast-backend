@@ -1,3 +1,5 @@
+
+
 from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -40,6 +42,10 @@ class Episode(Base):
     pub_date = Column(DateTime)
     summary = Column(Text)
     transcript = Column(Text)
-    __table_args__ = (UniqueConstraint("podcast_id", "guid", name="uq_episode"),)
+    audio_url = Column(String, nullable=True)    # stores the URL or path of downloaded audio
+
+    __table_args__ = (
+        UniqueConstraint("podcast_id", "guid", name="uq_episode"),
+    )
 
     podcast = relationship("Podcast", back_populates="episodes")

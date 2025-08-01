@@ -37,3 +37,4 @@ uvicorn[standard]
 python-dotenv
 SQLAlchemy
 psycopg2-binary
+pyngrok
