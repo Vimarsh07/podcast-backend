@@ -3,7 +3,9 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-import os
+
+import os, socket, logging
+from urllib.parse import urlparse
 import logging
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,6 +42,33 @@ app.add_middleware(
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+
+
+
+@app.on_event("startup")
+def check_db_network():
+    # parse the host + port out of DATABASE_URL
+    url = os.environ.get("DATABASE_URL", "")
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or 5432
+
+    logging.info(f"🧪 Resolving {host!r}")
+    try:
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        for family, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            fam = "IPv4" if family == socket.AF_INET else "IPv6"
+            logging.info(f"  → {fam} addr: {ip}")
+            try:
+                sock = socket.create_connection((ip, port), timeout=3)
+                sock.close()
+                logging.info(f"    ✅ {fam} connect OK")
+            except Exception as e:
+                logging.error(f"    ❌ {fam} connect failed: {e}")
+    except Exception as e:
+        logging.error(f"  Resolution failed: {e}")
 
 
 
