@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 from apscheduler.schedulers.background import BackgroundScheduler
-import replicate
+
 
 import crud
 from db import SessionLocal, init_db
@@ -37,7 +37,7 @@ app.add_middleware(
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-replicate_client = replicate.Client(api_token=os.environ["REPLICATE_API_TOKEN"])
+
 
 # ─── Dependencies ────────────────────────────────────────────────────────────
 def get_db():

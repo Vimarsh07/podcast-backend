@@ -1,11 +1,17 @@
 build:
-  gpu: true
+  # Specify a Python version compatible with your libraries and environment.
+  # Python 3.9 or 3.10 is generally a safe bet.
   python_version: "3.10"
-  python_packages:
-    - torch
-    - faster_whisper
-    - pyannote.audio
-    - requests
-    - huggingface-hub
+  python_requirements: "requirements.txt"
+  system_packages:
+    - "ffmpeg" # Essential for audio processing and often required by torchaudio and pyannote.audio
+    - "git" # Required if you're pulling any packages or models from Git repositories
+    # Add other system packages here if needed by your specific use case.
+    # For example, if you encounter errors like missing libopenblas.so.0,
+    # you might need - "libopenblas-dev".
+  run:
+   
+    - pip install pyannote.audio 
+  gpu: true
 
-predict: "transcriber:transcribe"
+predict: "transcriber.py:transcribe"

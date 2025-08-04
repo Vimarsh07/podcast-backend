@@ -8,8 +8,14 @@ __pycache__/
 
 # Environment files
 .env
-episodes.db
+hf_token.txt
+
 
 # Editor folders
 .vscode/
 .idea/
+
+#cog folder
+.cog/
+
+

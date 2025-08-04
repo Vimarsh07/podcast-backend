@@ -1,40 +1,7 @@
-# Core HTTP & RSS
-feedparser==6.0.10
-requests==2.31.0
-
-# FastAPI web framework
-fastapi==0.100.0
-uvicorn[standard]==0.23.2
-python-dotenv==1.0.0
-email-validator==1.3.1
-
-# Scheduling
-APScheduler==3.10.1
-
-# Database
-SQLAlchemy==2.0.24
-psycopg2-binary==2.9.7
-
-# Authentication
-passlib[bcrypt]==1.7.4
-python-jose[cryptography]==3.3.0
-
-# OpenAI for summarization
-openai==1.23.2
-
-# Local transcription & diarization
-torch==2.0.0+cpu           # or the CUDA build if you have GPU
-torchaudio==2.0.1+cpu      # match your torch build
+torch==2.1.1+cu118
+torchaudio==2.1.1+cu118
 faster-whisper==0.6.0
-pyannote.audio==2.1.1
-transformers==4.32.1
-datasets==2.13.1
-sentencepiece==0.1.99
 
-# Audio handling
-ffmpeg-python==0.2.0
-soundfile==0.12.1
-pydub==0.25.1
-
-# (Optional) Local tunnel for dev
-pyngrok==5.2.1
+onnxruntime-gpu  # Explicitly use the GPU version to avoid conflicts
+requests==2.31.0
+huggingface-hub==0.16.4

@@ -6,7 +6,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from db import SessionLocal
 from fastapi import HTTPException, status
-from main import replicate_client
+import replicate
 
 from model import User, Podcast, UserPodcast, Episode
 from auth import (
@@ -16,8 +16,12 @@ from auth import (
     decode_access_token,
 )
 import rss_handler
-import transcriber
+
 import summarizer
+
+
+replicate_client = replicate.Client(api_token=os.environ["REPLICATE_API_TOKEN"])
+
 
 # ─── Logger Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -199,19 +203,20 @@ def _fetch_and_process_latest(
     if only_if_new and podcast.last_fetched and podcast.last_fetched >= pub_dt:
         logger.info(f"ℹ️ No new episode (last_fetched={podcast.last_fetched})")
         return None
-
-    # 4) Determine audio URL
-    audio_url = next(
-        (l["href"] for l in latest.get("links", []) 
-         if l.get("type", "").startswith("audio")),
-        latest.get("link")
-    )
+ # 4) Determine audio URL from enclosure (fallback to links)
+    if getattr(latest, "enclosures", None):
+        audio_url = latest.enclosures[0]["href"]
+    else:
+        audio_url = next(
+            (l["href"] for l in latest.get("links", [])
+             if l.get("type", "").startswith("audio")),
+            latest.get("link")
+        )
     logger.info(f"ℹ️ Processing episode GUID={guid}, audio_url={audio_url}")
-
     # 5) Transcription via Replicate
     try:
         words: list[dict] = replicate_client.run(
-            "your-username/whisper-diarization:latest",  # ← replace with your model
+            "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",  # ← replace with your model
             input={"audio_url": audio_url}
         )
         transcript = " ".join(w["text"] for w in words)

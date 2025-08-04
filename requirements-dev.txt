@@ -1,0 +1,39 @@
+# Core HTTP & RSS
+feedparser==6.0.10
+requests==2.31.0
+
+# FastAPI web framework
+fastapi==0.100.0
+uvicorn[standard]==0.23.2
+python-dotenv==1.0.0
+
+
+# Scheduling
+APScheduler==3.10.1
+
+# Database
+SQLAlchemy==2.0.24
+psycopg2-binary==2.9.7
+
+# Authentication
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
+
+# OpenAI for summarization
+openai==0.28
+
+# Transformers & tokenizers (if you need them locally)
+transformers==4.32.1
+datasets==2.13.1
+sentencepiece==0.1.99
+
+# Audio handling (for any local tests or tools)
+ffmpeg-python==0.2.0
+soundfile==0.12.1
+pydub==0.25.1
+
+# (Optional) Local tunneling for dev
+pyngrok==5.2.1
+
+email-validator>=2.0
+replicate
