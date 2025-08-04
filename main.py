@@ -11,7 +11,7 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 from apscheduler.schedulers.background import BackgroundScheduler
-
+import uvicorn
 
 import crud
 from db import SessionLocal, init_db
@@ -23,6 +23,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
 
 # ─── Initialize DB & App ─────────────────────────────────────────────────────
 init_db()
