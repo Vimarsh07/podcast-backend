@@ -22,10 +22,11 @@ python-jose[cryptography]==3.3.0
 # OpenAI for summarization
 openai==0.28
 
-# Transformers & tokenizers (if you need them locally)
 transformers==4.32.1
 datasets==2.13.1
 sentencepiece==0.1.99
+tokenizers==0.13.3
+
 
 # Audio handling (for any local tests or tools)
 ffmpeg-python==0.2.0
