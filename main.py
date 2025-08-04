@@ -33,7 +33,7 @@ app = FastAPI(title="Podcast Summarizer API")
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "https://podcast-summarizer-frontend-cxk4et41v-vimarsh07s-projects.vercel.app/")],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "podcast-summarizer-frontend-seven.vercel.app")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
