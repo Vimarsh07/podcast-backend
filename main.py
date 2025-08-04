@@ -1,36 +1,45 @@
 # main.py
 
 from dotenv import load_dotenv
-load_dotenv()  # Load DATABASE_URL, SECRET_KEY, etc. from .env
+load_dotenv()
 
-from fastapi import FastAPI, Depends, HTTPException
+import os
+import logging
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
+from apscheduler.schedulers.background import BackgroundScheduler
+import replicate
 
 import crud
 from db import SessionLocal, init_db
-from model import Episode, User
+from model import User, Podcast as PodcastModel, Episode as EpisodeModel
 
-class SubscribeRequest(BaseModel):
-    feed_url: str
+# ─── Logging Setup ───────────────────────────────────────────────────────────
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# 1) Create all tables if they don't exist
+# ─── Initialize DB & App ─────────────────────────────────────────────────────
 init_db()
-
-# 2) Instantiate FastAPI
 app = FastAPI(title="Podcast Summarizer API")
 
-# 3) Enable CORS for React dev server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 4) Dependency: provide a database session for each request
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+replicate_client = replicate.Client(api_token=os.environ["REPLICATE_API_TOKEN"])
+
+# ─── Dependencies ────────────────────────────────────────────────────────────
 def get_db():
     db = SessionLocal()
     try:
@@ -38,98 +47,134 @@ def get_db():
     finally:
         db.close()
 
-# 5) OAuth2 scheme for extracting Bearer token from Authorization header
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+) -> User:
+    user = crud.get_current_user(db, token)
+    if not user:
+        logger.warning("Invalid or expired token")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    return user
 
-# 6) Pydantic models for request bodies
+# ─── Request Schemas ─────────────────────────────────────────────────────────
 class SignupRequest(BaseModel):
     email: EmailStr
     password: str
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    username: EmailStr   # front-end should send { "username": "...", "password": "..." }
     password: str
 
-# 7) Dependency: get the current authenticated user
-def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
-) -> User:
-    user = crud.get_current_user(db, token)  # raises 401 on invalid
-    return user
+class SubscribeRequest(BaseModel):
+    title: str
+    feed_url: str
 
-# --- Authentication Endpoints ---
-
+# ─── Auth Routes ─────────────────────────────────────────────────────────────
 @app.post("/signup")
 def signup(req: SignupRequest, db: Session = Depends(get_db)):
-    """
-    Create a new user. Expects JSON body:
-      { "email": "...", "password": "..." }
-    """
-    return crud.create_user(db, req.email, req.password)
+    logger.info(f"▶️  Signing up {req.email}")
+    try:
+        user = crud.create_user(db, req.email, req.password)
+        logger.info(f"✅  User created id={user.id}")
+        return user
+    except Exception as e:
+        logger.error(f"❌  Signup failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
-    """
-    Authenticate user. Expects JSON body:
-      { "email": "...", "password": "..." }
-    Returns a JWT token on success.
-    """
-    token = crud.authenticate_user(db, req.email, req.password)
+    logger.info(f"▶️  Login attempt for {req.username}")
+    token = crud.authenticate_user(db, req.username, req.password)
     if not token:
+        logger.warning("⚠️  Invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    logger.info("✅  Login successful")
     return {"access_token": token, "token_type": "bearer"}
 
-# --- Podcast Subscription Endpoints ---
-
+# ─── Podcast Routes ──────────────────────────────────────────────────────────
 @app.get("/podcasts")
-def list_podcasts(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """
-    List all podcasts the current user is subscribed to.
-    """
-    return crud.get_user_podcasts(db, current_user.id)
+def list_podcasts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    logger.info(f"▶️  Listing podcasts for user_id={user.id}")
+    return crud.get_user_podcasts(db, user.id)
 
-@app.post("/podcasts")
+@app.get("/podcasts/{podcast_id}")
+def get_podcast(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    logger.info(f"▶️  Fetch podcast {podcast_id} for user_id={user.id}")
+    if not crud.is_user_subscribed(db, user.id, podcast_id):
+        logger.warning("⚠️  Access denied — not subscribed")
+        raise HTTPException(status_code=403, detail="Not subscribed")
+    pod = db.query(PodcastModel).get(podcast_id)
+    if not pod:
+        logger.error("❌  Podcast not found")
+        raise HTTPException(status_code=404, detail="Not found")
+    return pod
+
+@app.post("/podcasts", status_code=201)
 def subscribe_podcast(
-    req: SubscribeRequest,  # now reads JSON { "feed_url": "…" }
+    req: SubscribeRequest,
+    bg: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user)
 ):
-    """
-    Subscribe the current user to a podcast by its RSS feed URL.
-    Expects JSON body: { "feed_url": "https://…" }
-    """
-    return crud.subscribe_podcast(db, current_user.id, req.feed_url)
+    logger.info(f"▶️  Subscribing user_id={user.id} to feed={req.feed_url}")
+    sub = crud.subscribe_podcast(db, user.id, req.feed_url, title=req.title)
+    logger.info(f"✅  Subscribed (podcast_id={sub.podcast_id})")
+    bg.add_task(crud.fetch_and_process_latest_async, sub.podcast_id)
+    logger.info("✅  Queued first-episode processing")
+    return {"podcast_id": sub.podcast_id, "status": "subscribed and queued"}
 
-# --- Episode Retrieval Endpoint ---
+@app.delete("/podcasts/{podcast_id}", status_code=status.HTTP_204_NO_CONTENT)
+def unsubscribe_podcast(
+    podcast_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    logger.info(f"▶️  Unsubscribing user_id={user.id} from podcast_id={podcast_id}")
+    crud.unsubscribe_podcast(db, user.id, podcast_id)
+    logger.info("✅  Unsubscribed")
+    return
 
+# ─── Episode Routes ─────────────────────────────────────────────────────────
 @app.get("/episodes/{podcast_id}")
 def get_episodes(
     podcast_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user)
 ):
-    """
-    Return all episodes (with summary/transcript) for a podcast.
-    """
-    if not crud.is_user_subscribed(db, current_user.id, podcast_id):
-        raise HTTPException(status_code=403, detail="Not subscribed to this podcast")
+    logger.info(f"▶️  Listing episodes for podcast_id={podcast_id}")
+    if not crud.is_user_subscribed(db, user.id, podcast_id):
+        logger.warning("⚠️  Access denied — not subscribed")
+        raise HTTPException(status_code=403, detail="Not subscribed")
     return crud.list_episodes(db, podcast_id)
 
 @app.post("/podcasts/{podcast_id}/fetch-latest")
-def fetch_latest_episode(
+def fetch_latest(
     podcast_id: int,
+    bg: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user)
 ):
-    """
-    Trigger a fetch/download/transcribe/summarize pass for the latest
-    episode of the given podcast and return the newly created Episode.
-    """
-    # make sure the user is subscribed
-    if not crud.is_user_subscribed(db, current_user.id, podcast_id):
+    logger.info(f"▶️  Manual fetch-latest for podcast_id={podcast_id}")
+    if not crud.is_user_subscribed(db, user.id, podcast_id):
+        logger.warning("⚠️  Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
-    return crud.fetch_and_process_latest(db, podcast_id)
+    bg.add_task(crud.fetch_and_process_latest_async, podcast_id)
+    logger.info("✅  Queued manual fetch")
+    return {"status": "queued"}
+
+# ─── Scheduler for daily polling ─────────────────────────────────────────────
+scheduler = BackgroundScheduler()
+scheduler.add_job(
+    crud.sync_all_podcasts_async,
+    trigger="cron",
+    hour=0,
+    minute=0,
+    timezone="UTC"
+)
+scheduler.start()
+logger.info("✅  Scheduler started — daily sync at 00:00 UTC")

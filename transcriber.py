@@ -1,79 +1,112 @@
-# transcriber.py
-
 import os
 import logging
+import requests
+import tempfile
 import torch
+
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
-# ─── Logging Setup ───────────────────────────────────────────────────────────
+# ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     level=logging.INFO
 )
+logger = logging.getLogger(__name__)
 
-# ─── Initialize Speaker-Diarization Pipeline ────────────────────────────────
-HF_TOKEN = (
-    os.getenv("HF_HUB_TOKEN")
-    or os.getenv("HUGGINGFACE_TOKEN")
-    or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-)
+# ─── Load Speaker-Diarization Pipeline ───────────────────────────────────────
+HF_TOKEN = os.getenv("HF_HUB_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
 try:
-    diari_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization", use_auth_token=HF_TOKEN or True
+    diarization_pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization",
+        use_auth_token=HF_TOKEN
     )
-    logging.info("✅ Pyannote speaker-diarization pipeline loaded")
+    logger.info("✅ Loaded pyannote speaker-diarization pipeline")
 except Exception as e:
-    logging.error(f"❌ Failed to load speaker-diarization pipeline: {e}")
-    diari_pipeline = None
+    logger.warning(f"⚠️ Could not load diarization pipeline: {e}")
+    diarization_pipeline = None
 
+# ─── Load Whisper Model ──────────────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+COMPUTE_TYPE = "float16" if DEVICE == "cuda" else "float32"
+try:
+    whisper_model = WhisperModel(
+        "base",
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE
+    )
+    logger.info(f"✅ Loaded WhisperModel(base) on {DEVICE} with {COMPUTE_TYPE}")
+except Exception as e:
+    logger.error(f"❌ Failed to load WhisperModel: {e}")
+    raise
 
-def transcribe(audio_path: str):
-    logging.info(f"Starting transcription for: {audio_path}")
+def transcribe(audio_url: str) -> list[dict]:
+    """
+    Downloads the audio at `audio_url`, runs Whisper ASR + pyannote diarization,
+    and returns a list of {start, end, text, speaker}.
+    """
+    logger.info(f"▶️ transcribe(): start for URL: {audio_url}")
 
-    # ─── ASR Model Load ────────────────────────────────────────────────────────
-    if torch.cuda.is_available():
-        try:
-            model = WhisperModel("base", device="cuda", compute_type="float16")
-            device = "cuda"
-        except Exception:
-            model = WhisperModel("base", device="cpu", compute_type="float32")
-            device = "cpu"
-    else:
-        model = WhisperModel("base", device="cpu", compute_type="float32")
-        device = "cpu"
-    logging.info(f"Using device={device}")
+    # 1) Download to temp file
+    try:
+        resp = requests.get(audio_url, stream=True, timeout=30)
+        resp.raise_for_status()
+        suffix = os.path.splitext(audio_url)[1] or ".mp3"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+            tf.write(resp.content)
+            temp_path = tf.name
+        logger.info(f"✅ Audio fetched to {temp_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch audio: {e}")
+        raise
 
-    # ─── Run ASR (word timestamps) ─────────────────────────────────────────────
-    segments, _ = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
-    words = [
-        {"start": w.start, "end": w.end, "text": w.word}
-        for seg in segments for w in seg.words
-    ]
-    logging.info(f"ASR complete: {len(words)} words")
+    # 2) Whisper ASR
+    try:
+        segments, _ = whisper_model.transcribe(
+            temp_path,
+            beam_size=5,
+            word_timestamps=True
+        )
+        words = [
+            {"start": w.start, "end": w.end, "text": w.word}
+            for seg in segments for w in seg.words
+        ]
+        logger.info(f"✅ ASR complete: {len(words)} words")
+    except Exception as e:
+        logger.error(f"❌ ASR failed: {e}")
+        words = []
 
-    # ─── Run Speaker Diarization ───────────────────────────────────────────────
-    if diari_pipeline:
-        try:
-            logging.info("Running speaker-diarization…")
-            diarization = diari_pipeline({"audio": audio_path})
-        except Exception as e:
-            logging.warning(f"Diarization failed ({e}); skipping speaker tags")
-            return [{**w, "speaker": None} for w in words]
-    else:
-        logging.warning("No diarization pipeline; skipping speaker tags")
-        return [{**w, "speaker": None} for w in words]
-
-    # ─── Assign Speakers to Words ──────────────────────────────────────────────
+    # 3) Speaker diarization
     labeled = []
-    for w in words:
-        spk = None
-        for turn, _, label in diarization.itertracks(yield_label=True):
-            if turn.start <= w["start"] < turn.end:
-                spk = label
-                break
-        labeled.append({**w, "speaker": spk})
+    if diarization_pipeline and words:
+        try:
+            logger.info("▶️ Running speaker diarization")
+            diarization = diarization_pipeline({"audio": temp_path})
+            for w in words:
+                spk = next(
+                    (
+                        label
+                        for turn, _, label in diarization.itertracks(yield_label=True)
+                        if turn.start <= w["start"] < turn.end
+                    ),
+                    None
+                )
+                labeled.append({**w, "speaker": spk})
+            logger.info(f"✅ Diarization complete: {len(labeled)} words labeled")
+        except Exception as e:
+            logger.error(f"❌ Diarization failed: {e}")
+            labeled = [{**w, "speaker": None} for w in words]
+    else:
+        if not diarization_pipeline:
+            logger.warning("⚠️ No diarization pipeline available")
+        labeled = [{**w, "speaker": None} for w in words]
 
-    logging.info(f"Assigned speaker labels to {len(labeled)} words")
+    # 4) Cleanup
+    try:
+        os.remove(temp_path)
+        logger.info(f"🗑️ Deleted temp file: {temp_path}")
+    except Exception:
+        logger.warning("⚠️ Could not delete temp file")
+
     return labeled

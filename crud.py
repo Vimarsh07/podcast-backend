@@ -1,9 +1,12 @@
 # crud.py
 
 import os
-from sqlalchemy.orm import Session
+import logging
 from datetime import datetime
+from sqlalchemy.orm import Session
+from db import SessionLocal
 from fastapi import HTTPException, status
+from main import replicate_client
 
 from model import User, Podcast, UserPodcast, Episode
 from auth import (
@@ -12,33 +15,42 @@ from auth import (
     create_access_token,
     decode_access_token,
 )
-import downloader
 import rss_handler
 import transcriber
 import summarizer
-import tempfile
 
+# ─── Logger Setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ─── User Management ─────────────────────────────────────────────────────────
 
 def create_user(db: Session, email: str, password: str) -> User:
     """Registers a new user, hashing their password."""
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Email already registered")
+
     hashed = get_password_hash(password)
     user = User(email=email, password_hash=hashed)
     db.add(user)
     db.commit()
     db.refresh(user)
+    logger.info(f"✅ Created user id={user.id}, email={email}")
     return user
-
 
 def authenticate_user(db: Session, email: str, password: str) -> str | None:
     """Verifies credentials and returns a JWT, or None if invalid."""
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
+        logger.warning(f"⚠️  Authentication failed for email={email}")
         return None
-    token = create_access_token({"sub": str(user.id)})
-    return token
 
+    token = create_access_token({"sub": str(user.id)})
+    logger.info(f"✅ Authenticated user id={user.id}")
+    return token
 
 def get_current_user(db: Session, token: str) -> User:
     """
@@ -47,12 +59,18 @@ def get_current_user(db: Session, token: str) -> User:
     """
     user_id = decode_access_token(token)
     if not user_id:
+        logger.error("❌ Invalid token")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
+
     user = db.query(User).get(int(user_id))
     if not user:
+        logger.error(f"❌ User not found id={user_id}")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+
+    logger.info(f"✅ get_current_user: id={user.id}, email={user.email}")
     return user
 
+# ─── Subscription Management ─────────────────────────────────────────────────
 
 def get_user_podcasts(db: Session, user_id: int) -> list[Podcast]:
     """Returns a list of Podcast objects the user is subscribed to."""
@@ -61,137 +79,173 @@ def get_user_podcasts(db: Session, user_id: int) -> list[Podcast]:
         .filter(UserPodcast.user_id == user_id)
         .all()
     )
-    return [sub.podcast for sub in subs]
+    podcasts = [sub.podcast for sub in subs]
+    logger.info(f"✅ Retrieved {len(podcasts)} subscriptions for user_id={user_id}")
+    return podcasts
 
-
-def subscribe_podcast(db: Session, user_id: int, feed_url: str) -> UserPodcast:
+def subscribe_podcast(db: Session, user_id: int, feed_url: str, title: str | None = None) -> UserPodcast:
     """
     Subscribes a user to a podcast.
     Creates the Podcast record if it doesn't already exist.
     """
-    # 1) fetch or create Podcast
     podcast = db.query(Podcast).filter(Podcast.feed_url == feed_url).first()
     if not podcast:
-        podcast = Podcast(feed_url=feed_url, last_fetched=None)
+        podcast = Podcast(feed_url=feed_url, title=title, last_fetched=None)
         db.add(podcast)
         db.commit()
         db.refresh(podcast)
+        logger.info(f"✅ Created Podcast id={podcast.id}, feed_url={feed_url}")
 
-    # 2) fetch or create subscription
     sub = (
         db.query(UserPodcast)
-        .filter(
-            UserPodcast.user_id == user_id,
-            UserPodcast.podcast_id == podcast.id,
-        )
+        .filter_by(user_id=user_id, podcast_id=podcast.id)
         .first()
     )
     if sub:
+        logger.info(f"ℹ️  User {user_id} already subscribed to podcast {podcast.id}")
         return sub
 
-    sub = UserPodcast(
-        user_id=user_id,
-        podcast_id=podcast.id,
-        subscribed_at=datetime.utcnow(),
-    )
+    sub = UserPodcast(user_id=user_id, podcast_id=podcast.id, subscribed_at=datetime.utcnow())
     db.add(sub)
     db.commit()
     db.refresh(sub)
+    logger.info(f"✅ Subscribed user_id={user_id} to podcast_id={podcast.id}")
     return sub
-
 
 def is_user_subscribed(db: Session, user_id: int, podcast_id: int) -> bool:
     """Returns True if the user has subscribed to the given podcast."""
-    return (
+    count = (
         db.query(UserPodcast)
-        .filter(
-            UserPodcast.user_id == user_id,
-            UserPodcast.podcast_id == podcast_id,
-        )
+        .filter_by(user_id=user_id, podcast_id=podcast_id)
         .count()
-        > 0
     )
+    subscribed = count > 0
+    logger.info(f"ℹ️  is_user_subscribed user_id={user_id}, podcast_id={podcast_id}: {subscribed}")
+    return subscribed
 
+def unsubscribe_podcast(db: Session, user_id: int, podcast_id: int) -> None:
+    """Removes a user’s subscription to a podcast."""
+    db.query(UserPodcast).filter_by(user_id=user_id, podcast_id=podcast_id).delete()
+    db.commit()
+    logger.info(f"✅ Unsubscribed user_id={user_id} from podcast_id={podcast_id}")
 
 def list_episodes(db: Session, podcast_id: int) -> list[Episode]:
     """
-    Returns all Episode objects for the given podcast, 
+    Returns all Episode objects for the given podcast,
     ordered by publication date descending.
     """
-    return (
+    episodes = (
         db.query(Episode)
         .filter(Episode.podcast_id == podcast_id)
         .order_by(Episode.pub_date.desc())
         .all()
     )
+    logger.info(f"✅ Retrieved {len(episodes)} episodes for podcast_id={podcast_id}")
+    return episodes
 
-def fetch_and_process_latest(db: Session, podcast_id: int) -> Episode:
-    """
-    1. Load the Podcast by ID
-    2. Parse its RSS feed and pick the newest entry
-    3. Skip if we've already stored that GUID
-    4. Download the audio, transcribe, summarize
-    5. Persist a new Episode record and return it
-    """
-    # 1. Lookup podcast
+# ─── Background & Polling ────────────────────────────────────────────────────
+
+def fetch_and_process_latest_async(podcast_id: int):
+    logger.info(f"▶️ fetch_and_process_latest_async: podcast_id={podcast_id}")
+    db = SessionLocal()
+    try:
+        _fetch_and_process_latest(db, podcast_id, only_if_new=False)
+    except Exception as e:
+        logger.error(f"❌ Async fetch_and_process_latest failed for podcast_id={podcast_id}: {e}")
+    finally:
+        db.close()
+
+def sync_all_podcasts_async():
+    logger.info("▶️ sync_all_podcasts_async: scanning all podcasts")
+    db = SessionLocal()
+    try:
+        for p in db.query(Podcast).all():
+            try:
+                _fetch_and_process_latest(db, p.id, only_if_new=True)
+            except Exception as e:
+                logger.error(f"❌ Polling podcast {p.id} failed: {e}")
+    finally:
+        db.close()
+
+def _fetch_and_process_latest(
+    db: Session,
+    podcast_id: int,
+    only_if_new: bool = False
+) -> Episode | None:
+    logger.info(f"▶️ _fetch_and_process_latest: podcast_id={podcast_id}, only_if_new={only_if_new}")
+
+    # 1) Load podcast record
     podcast = db.query(Podcast).get(podcast_id)
     if not podcast:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Podcast not found")
+        logger.error(f"❌ Podcast not found id={podcast_id}")
+        return None
 
-    # 2. Parse RSS entries
-    entries = rss_handler.parse_feed(podcast.feed_url)
+    # 2) Fetch & parse RSS
+    try:
+        entries = rss_handler.parse_feed(podcast.feed_url)
+        logger.info(f"✅ RSS parsed ({len(entries)} entries) for feed={podcast.feed_url}")
+    except Exception as e:
+        logger.error(f"❌ RSS parsing failed for feed={podcast.feed_url}: {e}")
+        return None
     if not entries:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "No entries in feed")
+        logger.warning(f"⚠️ No entries in feed {podcast.feed_url}")
+        return None
+
     latest = entries[0]
     guid = latest.get("id") or latest.get("guid") or latest.get("link")
-    
-    # 3. Skip if already processed
-    existing = (
-        db.query(Episode)
-          .filter_by(podcast_id=podcast_id, guid=guid)
-          .first()
+    pub_dt = datetime(*latest.published_parsed[:6])
+
+    # 3) Skip if already fetched
+    if only_if_new and podcast.last_fetched and podcast.last_fetched >= pub_dt:
+        logger.info(f"ℹ️ No new episode (last_fetched={podcast.last_fetched})")
+        return None
+
+    # 4) Determine audio URL
+    audio_url = next(
+        (l["href"] for l in latest.get("links", []) 
+         if l.get("type", "").startswith("audio")),
+        latest.get("link")
     )
-    if existing:
-        return existing
+    logger.info(f"ℹ️ Processing episode GUID={guid}, audio_url={audio_url}")
 
-    # 4. Download audio to a temp file
-    #    use enclosure link or default to entry.link
-    audio_url = None
-    for link in latest.get("links", []):
-        if link.get("type", "").startswith("audio"):
-            audio_url = link["href"]
-            break
-    if not audio_url:
-        audio_url = latest.get("link")
-    temp_dir = tempfile.gettempdir()
-    filename = f"podcast_{podcast_id}_{guid}.mp3"
-    output_path = os.path.join(temp_dir, filename)
-    downloader.download_audio(audio_url, output_path)
+    # 5) Transcription via Replicate
+    try:
+        words: list[dict] = replicate_client.run(
+            "your-username/whisper-diarization:latest",  # ← replace with your model
+            input={"audio_url": audio_url}
+        )
+        transcript = " ".join(w["text"] for w in words)
+        logger.info("✅ Replicate transcription complete")
+    except Exception as e:
+        logger.error(f"❌ Replicate transcription error for GUID={guid}: {e}")
+        return None
 
-    # 5. Transcribe (returns list of word dicts) 
-    word_segments = transcriber.transcribe(output_path)
-    # join into a single transcript string
-    transcript_text = " ".join(w["text"] for w in word_segments)
+    # 6) Summarization
+    try:
+        summary = summarizer.summarize_with_openai(transcript)
+        logger.info("✅ Summarization complete")
+    except Exception as e:
+        logger.error(f"❌ Summarization error for GUID={guid}: {e}")
+        summary = ""
 
-    # 6. Summarize via OpenAI helper
-    summary_text = summarizer.summarize_with_openai(transcript_text)
-
-    # 7. Persist Episode
-    ep = Episode(
-        podcast_id=podcast_id,
-        guid=guid,
-        title=latest.get("title"),
-        pub_date=latest.get("published_parsed") and datetime(*latest["published_parsed"][:6]),
-        transcript=transcript_text,
-        summary=summary_text,
-        audio_url=audio_url
-    )
-    db.add(ep)
-    db.commit()
-    db.refresh(ep)
-
-    # 8. Update podcast.last_fetched
-    podcast.last_fetched = datetime.utcnow()
-    db.commit()
-
-    return ep
+    # 7) Persist the new Episode
+    try:
+        ep = Episode(
+            podcast_id=podcast_id,
+            guid=guid,
+            title=latest.get("title"),
+            pub_date=pub_dt,
+            transcript=transcript,
+            summary=summary,
+            audio_url=audio_url
+        )
+        db.add(ep)
+        podcast.last_fetched = pub_dt
+        db.commit()
+        db.refresh(ep)
+        logger.info(f"✅ Episode saved id={ep.id}")
+        return ep
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ DB save error for GUID={guid}: {e}")
+        return None
