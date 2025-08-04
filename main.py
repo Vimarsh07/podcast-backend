@@ -3,82 +3,51 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-
-import os, socket, logging
-from urllib.parse import urlparse
+import os
 import logging
+import socket
+from urllib.parse import urlparse
+
+import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 from apscheduler.schedulers.background import BackgroundScheduler
-import uvicorn
 
 import crud
 from db import SessionLocal, init_db
 from model import User, Podcast as PodcastModel, Episode as EpisodeModel
 
-# ─── Logging Setup ───────────────────────────────────────────────────────────
+# ─── Logging Configuration ───────────────────────────────────────────────────
 logging.basicConfig(
     format='[%(asctime)s] %(levelname)s: %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
-
-# ─── Initialize DB & App ─────────────────────────────────────────────────────
-init_db()
+# ─── FastAPI App Setup ───────────────────────────────────────────────────────
 app = FastAPI(title="Podcast Summarizer API")
 
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")],
+    allow_origins=[os.getenv("FRONTEND_ORIGIN", "https://podcast-summarizer-frontend-cxk4et41v-vimarsh07s-projects.vercel.app/")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
-
-
-
-@app.on_event("startup")
-def check_db_network():
-    # parse the host + port out of DATABASE_URL
-    url = os.environ.get("DATABASE_URL", "")
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    port = parsed.port or 5432
-
-    logging.info(f"🧪 Resolving {host!r}")
-    try:
-        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
-        for family, _, _, _, sockaddr in addrs:
-            ip = sockaddr[0]
-            fam = "IPv4" if family == socket.AF_INET else "IPv6"
-            logging.info(f"  → {fam} addr: {ip}")
-            try:
-                sock = socket.create_connection((ip, port), timeout=3)
-                sock.close()
-                logging.info(f"    ✅ {fam} connect OK")
-            except Exception as e:
-                logging.error(f"    ❌ {fam} connect failed: {e}")
-    except Exception as e:
-        logging.error(f"  Resolution failed: {e}")
-
-
-
-# ─── Dependencies ────────────────────────────────────────────────────────────
+# ─── Dependency Injection ────────────────────────────────────────────────────
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -96,39 +65,72 @@ class SignupRequest(BaseModel):
     password: str
 
 class LoginRequest(BaseModel):
-    username: EmailStr   # front-end should send { "username": "...", "password": "..." }
+    username: EmailStr  # expecting {"username": "...", "password": "..."}
     password: str
 
 class SubscribeRequest(BaseModel):
     title: str
     feed_url: str
 
-# ─── Auth Routes ─────────────────────────────────────────────────────────────
+# ─── Startup Events ──────────────────────────────────────────────────────────
+@app.on_event("startup")
+def on_startup():
+    # Network diagnostics for database connectivity
+    url = os.environ.get("DATABASE_URL", "")
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or 5432
+
+    logger.info(f"🧪 Resolving {host!r}")
+    try:
+        addrs = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        for family, _, _, _, sockaddr in addrs:
+            ip = sockaddr[0]
+            fam = "IPv4" if family == socket.AF_INET else "IPv6"
+            logger.info(f"  → {fam} addr: {ip}")
+            try:
+                sock = socket.create_connection((ip, port), timeout=3)
+                sock.close()
+                logger.info(f"    ✅ {fam} connect OK")
+            except Exception as e:
+                logger.error(f"    ❌ {fam} connect failed: {e}")
+    except Exception as e:
+        logger.error(f"  Resolution failed: {e}")
+
+    # Initialize the database (create tables)
+    init_db()
+    logger.info("✅ Database initialized")
+
+# ─── Authentication Routes ──────────────────────────────────────────────────
 @app.post("/signup")
 def signup(req: SignupRequest, db: Session = Depends(get_db)):
-    logger.info(f"▶️  Signing up {req.email}")
+    logger.info(f"▶️ Signing up {req.email}")
     try:
         user = crud.create_user(db, req.email, req.password)
-        logger.info(f"✅  User created id={user.id}")
+        logger.info(f"✅ User created id={user.id}")
         return user
     except Exception as e:
-        logger.error(f"❌  Signup failed: {e}")
+        logger.error(f"❌ Signup failed: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
-    logger.info(f"▶️  Login attempt for {req.username}")
+    logger.info(f"▶️ Login attempt for {req.username}")
     token = crud.authenticate_user(db, req.username, req.password)
     if not token:
-        logger.warning("⚠️  Invalid credentials")
+        logger.warning("⚠️ Invalid credentials")
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    logger.info("✅  Login successful")
+    logger.info("✅ Login successful")
     return {"access_token": token, "token_type": "bearer"}
 
 # ─── Podcast Routes ──────────────────────────────────────────────────────────
 @app.get("/podcasts")
-def list_podcasts(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    logger.info(f"▶️  Listing podcasts for user_id={user.id}")
+def list_podcasts(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user)
+):
+    logger.info(f"▶️ Listing podcasts for user_id={user.id}")
     return crud.get_user_podcasts(db, user.id)
 
 @app.get("/podcasts/{podcast_id}")
@@ -137,13 +139,13 @@ def get_podcast(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    logger.info(f"▶️  Fetch podcast {podcast_id} for user_id={user.id}")
+    logger.info(f"▶️ Fetch podcast {podcast_id} for user_id={user.id}")
     if not crud.is_user_subscribed(db, user.id, podcast_id):
-        logger.warning("⚠️  Access denied — not subscribed")
+        logger.warning("⚠️ Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
     pod = db.query(PodcastModel).get(podcast_id)
     if not pod:
-        logger.error("❌  Podcast not found")
+        logger.error("❌ Podcast not found")
         raise HTTPException(status_code=404, detail="Not found")
     return pod
 
@@ -154,11 +156,11 @@ def subscribe_podcast(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    logger.info(f"▶️  Subscribing user_id={user.id} to feed={req.feed_url}")
+    logger.info(f"▶️ Subscribing user_id={user.id} to feed={req.feed_url}")
     sub = crud.subscribe_podcast(db, user.id, req.feed_url, title=req.title)
-    logger.info(f"✅  Subscribed (podcast_id={sub.podcast_id})")
+    logger.info(f"✅ Subscribed (podcast_id={sub.podcast_id})")
     bg.add_task(crud.fetch_and_process_latest_async, sub.podcast_id)
-    logger.info("✅  Queued first-episode processing")
+    logger.info("✅ Queued first-episode processing")
     return {"podcast_id": sub.podcast_id, "status": "subscribed and queued"}
 
 @app.delete("/podcasts/{podcast_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -167,10 +169,9 @@ def unsubscribe_podcast(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    logger.info(f"▶️  Unsubscribing user_id={user.id} from podcast_id={podcast_id}")
+    logger.info(f"▶️ Unsubscribing user_id={user.id} from podcast_id={podcast_id}")
     crud.unsubscribe_podcast(db, user.id, podcast_id)
-    logger.info("✅  Unsubscribed")
-    return
+    logger.info("✅ Unsubscribed")
 
 # ─── Episode Routes ─────────────────────────────────────────────────────────
 @app.get("/episodes/{podcast_id}")
@@ -179,9 +180,9 @@ def get_episodes(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    logger.info(f"▶️  Listing episodes for podcast_id={podcast_id}")
+    logger.info(f"▶️ Listing episodes for podcast_id={podcast_id}")
     if not crud.is_user_subscribed(db, user.id, podcast_id):
-        logger.warning("⚠️  Access denied — not subscribed")
+        logger.warning("⚠️ Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
     return crud.list_episodes(db, podcast_id)
 
@@ -192,15 +193,15 @@ def fetch_latest(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user)
 ):
-    logger.info(f"▶️  Manual fetch-latest for podcast_id={podcast_id}")
+    logger.info(f"▶️ Manual fetch-latest for podcast_id={podcast_id}")
     if not crud.is_user_subscribed(db, user.id, podcast_id):
-        logger.warning("⚠️  Access denied — not subscribed")
+        logger.warning("⚠️ Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
     bg.add_task(crud.fetch_and_process_latest_async, podcast_id)
-    logger.info("✅  Queued manual fetch")
+    logger.info("✅ Queued manual fetch")
     return {"status": "queued"}
 
-# ─── Scheduler for daily polling ─────────────────────────────────────────────
+# ─── Scheduler for Daily Sync ─────────────────────────────────────────────────
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     crud.sync_all_podcasts_async,
@@ -210,4 +211,9 @@ scheduler.add_job(
     timezone="UTC"
 )
 scheduler.start()
-logger.info("✅  Scheduler started — daily sync at 00:00 UTC")
+logger.info("✅ Scheduler started — daily sync at 00:00 UTC")
+
+# ─── Application Entry Point ─────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
