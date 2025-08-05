@@ -72,6 +72,15 @@ class SubscribeRequest(BaseModel):
     title: str
     feed_url: str
 
+
+@app.get("/health", include_in_schema=False)
+def health():
+    """
+    Simple health check endpoint.
+    Returns HTTP 200 with a JSON payload so external pings keep the server alive.
+    """
+    return {"status": "ok"}
+
 # ─── Startup Events ──────────────────────────────────────────────────────────
 @app.on_event("startup")
 def on_startup():
