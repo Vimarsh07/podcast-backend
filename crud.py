@@ -301,9 +301,8 @@ def transcribe_and_summarize_episode_async(episode_id: int, summary_words: int =
         logger.info(f"▶️ Replicate: transcribing episode_id={episode_id}")
         words: List[dict] = replicate_client.run(
             # keep your pinned model/version here
-            "vimarsh07/podcast-transcriber:5277e7ba4b59ae84f0817e2bf69ee755e0580198817a2e8389a1aca647dba3f2",
-            input={"audio_url": _get_audio_url_for(episode_id),
-                   "hf_token": os.getenv("HF_TOKEN") or os.getenv("HF_HUB_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")},
+            "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",
+            input={"audio_url": _get_audio_url_for(episode_id)},
         )
         transcript_text = " ".join((w.get("text") or "").strip() for w in words).strip()
         logger.info("✅ Replicate transcription complete")
