@@ -12,9 +12,8 @@ build:
     - echo "HF_HOME=/root/.cache/huggingface" >> /etc/environment
     - pip install pyannote.audio
      # debug: confirm your files are in /src
-    - sh -lc "pwd; ls -la /src"
-    # run the preload script from the container copy
-    - python /tmp/preload_pyannote.py
+   
+    - python /src/preload_pyannote.py
 
   gpu: true
 

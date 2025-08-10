@@ -17,7 +17,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import crud
 from db import SessionLocal, init_db
-from model import User, Podcast as PodcastModel, Episode as EpisodeModel
+from model import User, Podcast as PodcastModel,TranscriptStatus, Episode as EpisodeModel
 
 # ─── Logging Configuration ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -44,8 +44,12 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
+
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -218,23 +222,22 @@ def transcribe_and_summarize(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    # Make sure the user is subscribed to the parent podcast
     ep = db.query(EpisodeModel).get(episode_id)
     if not ep:
         raise HTTPException(status_code=404, detail="Episode not found")
     if not crud.is_user_subscribed(db, user.id, ep.podcast_id):
         raise HTTPException(status_code=403, detail="Not subscribed to this podcast")
 
-    # If not forcing and it's already completed, short-circuit
+    # Skip if already fully done and not forcing
     if not body.force and getattr(ep, "transcript", None) and getattr(ep, "summary", None):
         return {"message": "Already completed", "episode_id": episode_id}
 
-    # Queue the job; CRUD will update transcript/summary/status on the same row
-    bg.add_task(
-        crud.transcribe_and_summarize_episode_async,
-        episode_id,
-        (body.summary_words or 800)
-    )
+    # ✅ mark QUEUED and COMMIT before enqueueing
+    if hasattr(ep, "transcript_status"):
+        ep.transcript_status = TranscriptStatus.QUEUED
+        db.commit()
+
+    bg.add_task(crud.transcribe_and_summarize_episode_async, episode_id, (body.summary_words or 800))
     return {"message": "Queued", "episode_id": episode_id}
 
 # ─── Scheduler for Daily Sync ────────────────────────────────────────────────

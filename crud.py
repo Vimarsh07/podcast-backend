@@ -20,9 +20,6 @@ from auth import (
 
 import rss_handler
 from rss_handler import (
-    # These helpers make ingest consistent across quirky feeds.
-    # If your rss_handler doesn't expose some of these, remove them here
-    # and keep the inline logic below (the ingest still works).
     extract_transcript_if_present,
     get_guid,
     get_pub_date,
@@ -159,32 +156,25 @@ def list_episodes(db: Session, podcast_id: int) -> List[Episode]:
 def fetch_latest_metadata_async(podcast_id: int, limit: int = 10):
     """
     Background-friendly wrapper to ingest the latest N episodes' metadata (no transcription).
-    Call this after adding a podcast so the UI can show the newest 10 for user selection.
     """
     logger.info(f"▶️ fetch_latest_metadata_async: podcast_id={podcast_id}, limit={limit}")
-    db = SessionLocal()
-    try:
-        ingest_latest_metadata(db, podcast_id, limit=limit)
-    except Exception as e:
-        logger.error(f"❌ Async metadata ingest failed for podcast_id={podcast_id}: {e}")
-    finally:
-        db.close()
+    with SessionLocal() as db:
+        try:
+            ingest_latest_metadata(db, podcast_id, limit=limit)
+        except Exception as e:
+            logger.error(f"❌ Async metadata ingest failed for podcast_id={podcast_id}: {e}")
 
 def sync_all_podcasts_metadata_async(limit: int = 10):
     """
     Periodic refresher for ALL podcasts—keeps the episode lists up-to-date (metadata only).
-    Useful to run hourly/daily via a scheduler so users always see the latest episodes.
     """
     logger.info("▶️ sync_all_podcasts_metadata_async: scanning all podcasts")
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         for p in db.query(Podcast).all():
             try:
                 ingest_latest_metadata(db, p.id, limit=limit)
             except Exception as e:
                 logger.error(f"❌ Metadata ingest for podcast {p.id} failed: {e}")
-    finally:
-        db.close()
 
 def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> List[Episode]:
     """
@@ -198,10 +188,10 @@ def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> Lis
         logger.error(f"❌ Podcast not found id={podcast_id}")
         return []
 
-    # Parse RSS (compatible with parse_feed returning a full feed or just entries)
+    # Parse RSS
     try:
         feed = rss_handler.parse_feed(podcast.feed_url)
-        entries = getattr(feed, "entries", feed)  # keeps backward compatibility
+        entries = getattr(feed, "entries", feed)
         logger.info(f"✅ RSS parsed ({len(entries)} entries) for feed={podcast.feed_url}")
     except Exception as e:
         logger.error(f"❌ RSS parsing failed for feed={podcast.feed_url}: {e}")
@@ -215,31 +205,31 @@ def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> Lis
     newest_dt: Optional[datetime] = None
 
     for entry in entries[:limit]:
-        # Use helper functions when available for robustness across feeds.
         guid = get_guid(entry) or f"{podcast_id}:{entry.get('title','')}-{entry.get('published','')}"
-        pub_dt = get_pub_date(entry)  # tz-aware UTC if present
+        pub_dt = get_pub_date(entry)
         audio_url = get_audio_url(entry)
         duration_seconds = get_duration_seconds(entry)
         image_url = get_image_url(entry)
 
         # UPSERT by (podcast_id, guid)
         ep = db.query(Episode).filter_by(podcast_id=podcast_id, guid=guid).first()
+        is_new = False
         if not ep:
             ep = Episode(podcast_id=podcast_id, guid=guid)
             db.add(ep)
+            is_new = True
 
         ep.title = entry.get("title")
         ep.pub_date = pub_dt
-        ep.summary = entry.get("summary") or entry.get("subtitle")  # short description
+        ep.summary = entry.get("summary") or entry.get("subtitle")
         ep.audio_url = audio_url
 
-        # Optional extras (present if you ran the migration + model update)
         if hasattr(Episode, "duration_seconds"):
             ep.duration_seconds = duration_seconds
         if hasattr(Episode, "image_url"):
             ep.image_url = image_url
 
-        # If feed embeds a transcript, store it (free value), but still default to NOT_REQUESTED
+        # If feed embeds a transcript, store it if we don't already have one
         try:
             maybe_transcript = extract_transcript_if_present(entry)
         except Exception:
@@ -247,15 +237,17 @@ def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> Lis
         if maybe_transcript and not ep.transcript:
             ep.transcript = maybe_transcript
 
-        if hasattr(Episode, "transcript_status") and not ep.transcript:
-            ep.transcript_status = TranscriptStatus.NOT_REQUESTED
+        # ✅ Only set NOT_REQUESTED when the episode is new or still in NOT_REQUESTED/None
+        if hasattr(Episode, "transcript_status"):
+            if is_new or getattr(ep, "transcript_status", None) in (None, TranscriptStatus.NOT_REQUESTED):
+                if not ep.transcript:  # only if we don't have any transcript yet
+                    ep.transcript_status = TranscriptStatus.NOT_REQUESTED
+            # Do NOT touch status if it's QUEUED/TRANSCRIBING/COMPLETED/FAILED
 
         processed.append(ep)
-
         if pub_dt and (newest_dt is None or pub_dt > newest_dt):
             newest_dt = pub_dt
 
-    # Mark podcast-level last_fetched to the newest episode we saw
     if newest_dt:
         podcast.last_fetched = newest_dt
 
@@ -271,89 +263,82 @@ def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> Lis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _summarize_safely(text: str, max_words: int = 500) -> str:
-    """
-    Handle either summarizer.summarize_with_openai(text, max_words=...)
-    or summarizer.summarize_with_openai(text) if your function doesn't take max_words.
-    """
+    """Call your summarizer with max_words if available."""
     try:
-        return summarizer.summarize_with_openai(text, max_words=max_words)  # preferred
+        return summarizer.summarize_with_openai(text, max_words=max_words)
     except TypeError:
-        return summarizer.summarize_with_openai(text)  # backward compatible
+        return summarizer.summarize_with_openai(text)
+
+def _get_audio_url_for(episode_id: int) -> str:
+    with SessionLocal() as db:
+        ep = db.query(Episode).get(episode_id)
+        if not ep or not ep.audio_url:
+            raise RuntimeError(f"Episode {episode_id} missing audio_url")
+        return ep.audio_url
 
 def transcribe_and_summarize_episode_async(episode_id: int, summary_words: int = 500):
     """
-    Background-friendly wrapper. If you add a proper task queue later (Celery/RQ),
-    call the sync function from the worker instead.
+    Background-friendly wrapper executed by FastAPI BackgroundTasks.
+    Uses short-lived DB sessions before/after the long compute.
     """
-    db = SessionLocal()
-    try:
-        transcribe_and_summarize_episode(db, episode_id, summary_words=summary_words)
-    except Exception as e:
-        logger.error(f"❌ Episode processing failed id={episode_id}: {e}")
-    finally:
-        db.close()
-
-def transcribe_and_summarize_episode(
-    db: Session,
-    episode_id: int,
-    summary_words: int = 500
-) -> Optional[Episode]:
-    """
-    Transcribes via Replicate using the episode's audio_url,
-    summarizes the transcript, and updates the SAME episode row.
-    """
-    ep = db.query(Episode).get(episode_id)
-    if not ep:
-        logger.error(f"❌ Episode not found id={episode_id}")
-        return None
-    if not ep.audio_url:
-        logger.error(f"❌ Episode {episode_id} has no audio_url")
-        return None
-
-    # Fast-path to avoid duplicate work (optional)
-    if getattr(ep, "transcript_status", None) == TranscriptStatus.COMPLETED and ep.transcript and ep.summary:
-        logger.info(f"ℹ️ Episode {episode_id} already COMPLETED; skipping.")
-        return ep
-
-    # Mark status -> TRANSCRIBING
-    if hasattr(Episode, "transcript_status"):
-        ep.transcript_status = TranscriptStatus.TRANSCRIBING
+    # 1) Mark TRANSCRIBING quickly in its own transaction
+    with SessionLocal() as db:
+        ep = db.query(Episode).get(episode_id)
+        if not ep:
+            logger.error(f"❌ Episode not found id={episode_id}")
+            return
+        if hasattr(Episode, "transcript_status"):
+            ep.transcript_status = TranscriptStatus.TRANSCRIBING
         db.commit()
 
-    # --- Your Replicate call stays AS-IS ---
+    # 2) Long-running work WITHOUT any session held
     try:
         logger.info(f"▶️ Replicate: transcribing episode_id={episode_id}")
         words: List[dict] = replicate_client.run(
+            # keep your pinned model/version here
             "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",
-            input={"audio_url": ep.audio_url}
+            input={"audio_url": _get_audio_url_for(episode_id)},
         )
         transcript_text = " ".join((w.get("text") or "").strip() for w in words).strip()
         logger.info("✅ Replicate transcription complete")
     except Exception as e:
         logger.error(f"❌ Replicate transcription error for episode_id={episode_id}: {e}")
-        if hasattr(Episode, "transcript_status"):
-            ep.transcript_status = TranscriptStatus.FAILED
-            db.commit()
-        return None
+        with SessionLocal() as db:
+            ep = db.query(Episode).get(episode_id)
+            if ep and hasattr(Episode, "transcript_status"):
+                ep.transcript_status = TranscriptStatus.FAILED
+                db.commit()
+        return
 
-    # Summarize
     try:
-        summary_text = summarizer.summarize_with_openai(
-        transcript_text,
-        max_words=summary_words  # e.g., 800–1000 if you want longer
-       )
+        summary_text = _summarize_safely(transcript_text, max_words=summary_words)
         logger.info("✅ Summarization complete")
     except Exception as e:
         logger.error(f"❌ Summarization error for episode_id={episode_id}: {e}")
         summary_text = ""
 
-    # Persist on SAME episode row
-    ep.transcript = transcript_text
-    ep.summary = summary_text
-    if hasattr(Episode, "transcript_status"):
-        ep.transcript_status = TranscriptStatus.COMPLETED
-
-    db.commit()
-    db.refresh(ep)
-    logger.info(f"✅ Episode updated id={ep.id} (transcript + summary)")
-    return ep
+    # 3) Save results in a fresh session; retry on transient DB failures
+    import time
+    for attempt in range(3):
+        try:
+            with SessionLocal() as db:
+                ep = db.query(Episode).get(episode_id)
+                if not ep:
+                    return
+                ep.transcript = transcript_text
+                ep.summary = summary_text
+                if hasattr(Episode, "transcript_status"):
+                    ep.transcript_status = TranscriptStatus.COMPLETED
+                db.commit()
+            logger.info(f"✅ Episode updated id={episode_id} (transcript + summary)")
+            break
+        except Exception as e:
+            logger.error(f"⚠️ DB write attempt {attempt+1} failed for episode_id={episode_id}: {e}")
+            time.sleep(1.5 * (attempt + 1))
+            if attempt == 2:
+                with SessionLocal() as db2:
+                    ep2 = db2.query(Episode).get(episode_id)
+                    if ep2 and hasattr(Episode, "transcript_status"):
+                        ep2.transcript_status = TranscriptStatus.FAILED
+                        db2.commit()
+                raise
