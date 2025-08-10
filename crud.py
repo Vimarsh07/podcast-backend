@@ -221,7 +221,12 @@ def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> Lis
 
         ep.title = entry.get("title")
         ep.pub_date = pub_dt
-        ep.summary = entry.get("summary") or entry.get("subtitle")
+        feed_summary = entry.get("summary") or entry.get("subtitle")
+
+       # ✅ Only take the RSS summary if we don't already have an ASR-produced summary.
+       #    Concretely: if there's no summary yet, or the episode has NOT been completed.
+        if not ep.summary or getattr(ep, "transcript_status", None) in (None, TranscriptStatus.NOT_REQUESTED, TranscriptStatus.FAILED):
+           ep.summary = feed_summary
         ep.audio_url = audio_url
 
         if hasattr(Episode, "duration_seconds"):
