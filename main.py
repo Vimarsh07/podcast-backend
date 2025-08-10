@@ -1,5 +1,4 @@
-# main.py
-
+# ======================== main.py ========================
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -48,7 +47,6 @@ def get_db():
     finally:
         db.close()
 
-
 def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
@@ -72,13 +70,13 @@ class SubscribeRequest(BaseModel):
     title: str
     feed_url: str
 
+class TranscribeRequest(BaseModel):
+    summary_words: int | None = 800
+    force: bool = False
 
 @app.get("/health", include_in_schema=False)
 def health():
-    """
-    Simple health check endpoint.
-    Returns HTTP 200 with a JSON payload so external pings keep the server alive.
-    """
+    """Simple health check endpoint."""
     return {"status": "ok"}
 
 # ─── Startup Events ──────────────────────────────────────────────────────────
@@ -121,7 +119,6 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"❌ Signup failed: {e}")
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/login")
 def login(req: LoginRequest, db: Session = Depends(get_db)):
@@ -168,8 +165,9 @@ def subscribe_podcast(
     logger.info(f"▶️ Subscribing user_id={user.id} to feed={req.feed_url}")
     sub = crud.subscribe_podcast(db, user.id, req.feed_url, title=req.title)
     logger.info(f"✅ Subscribed (podcast_id={sub.podcast_id})")
-    bg.add_task(crud.fetch_and_process_latest_async, sub.podcast_id)
-    logger.info("✅ Queued first-episode processing")
+    # Queue metadata-only ingest so UI can show latest 10 episodes to pick from
+    bg.add_task(crud.fetch_latest_metadata_async, sub.podcast_id, 10)
+    logger.info("✅ Queued metadata ingest")
     return {"podcast_id": sub.podcast_id, "status": "subscribed and queued"}
 
 @app.delete("/podcasts/{podcast_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -200,27 +198,56 @@ def fetch_latest(
     podcast_id: int,
     bg: BackgroundTasks,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
+    limit: int = 10
 ):
-    logger.info(f"▶️ Manual fetch-latest for podcast_id={podcast_id}")
+    logger.info(f"▶️ Manual fetch-latest for podcast_id={podcast_id} (limit={limit})")
     if not crud.is_user_subscribed(db, user.id, podcast_id):
         logger.warning("⚠️ Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
-    bg.add_task(crud.fetch_and_process_latest_async, podcast_id)
-    logger.info("✅ Queued manual fetch")
-    return {"status": "queued"}
+    # Queue metadata-only ingest (no transcription)
+    bg.add_task(crud.fetch_latest_metadata_async, podcast_id, limit)
+    logger.info("✅ Queued metadata ingest")
+    return {"status": "queued", "limit": limit}
 
-# ─── Scheduler for Daily Sync ─────────────────────────────────────────────────
+@app.post("/episodes/{episode_id}/transcribe-and-summarize")
+def transcribe_and_summarize(
+    episode_id: int,
+    body: TranscribeRequest,
+    bg: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    # Make sure the user is subscribed to the parent podcast
+    ep = db.query(EpisodeModel).get(episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    if not crud.is_user_subscribed(db, user.id, ep.podcast_id):
+        raise HTTPException(status_code=403, detail="Not subscribed to this podcast")
+
+    # If not forcing and it's already completed, short-circuit
+    if not body.force and getattr(ep, "transcript", None) and getattr(ep, "summary", None):
+        return {"message": "Already completed", "episode_id": episode_id}
+
+    # Queue the job; CRUD will update transcript/summary/status on the same row
+    bg.add_task(
+        crud.transcribe_and_summarize_episode_async,
+        episode_id,
+        (body.summary_words or 800)
+    )
+    return {"message": "Queued", "episode_id": episode_id}
+
+# ─── Scheduler for Daily Sync ────────────────────────────────────────────────
 scheduler = BackgroundScheduler()
 scheduler.add_job(
-    crud.sync_all_podcasts_async,
+    crud.sync_all_podcasts_metadata_async,  # << updated function
     trigger="cron",
     hour=0,
     minute=0,
     timezone="UTC"
 )
 scheduler.start()
-logger.info("✅ Scheduler started — daily sync at 00:00 UTC")
+logger.info("✅ Scheduler started — daily metadata sync at 00:00 UTC")
 
 # ─── Application Entry Point ─────────────────────────────────────────────────
 if __name__ == "__main__":

@@ -1,17 +1,21 @@
+
 build:
-  # Specify a Python version compatible with your libraries and environment.
-  # Python 3.9 or 3.10 is generally a safe bet.
   python_version: "3.10"
   python_requirements: "requirements.txt"
   system_packages:
-    - "ffmpeg" # Essential for audio processing and often required by torchaudio and pyannote.audio
-    - "git" # Required if you're pulling any packages or models from Git repositories
-    # Add other system packages here if needed by your specific use case.
-    # For example, if you encounter errors like missing libopenblas.so.0,
-    # you might need - "libopenblas-dev".
+    - ffmpeg
+    - libsndfile1
+    - git
+    - "libopenblas-dev"
   run:
-   
-    - pip install pyannote.audio 
+    - mkdir -p /root/.cache/huggingface
+    - echo "HF_HOME=/root/.cache/huggingface" >> /etc/environment
+    - pip install pyannote.audio
+     # debug: confirm your files are in /src
+    - sh -lc "pwd; ls -la /src"
+    # run the preload script from the container copy
+    - python /tmp/preload_pyannote.py
+
   gpu: true
 
 predict: "transcriber.py:transcribe"

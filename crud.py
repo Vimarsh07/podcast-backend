@@ -1,29 +1,40 @@
-# crud.py
-
+# ======================== crud.py ========================
 import os
 import logging
-from datetime import datetime
-from sqlalchemy.orm import Session
-from db import SessionLocal
+from datetime import datetime, timezone
+from typing import List, Optional
+
 from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
+
 import replicate
 
-from model import User, Podcast, UserPodcast, Episode
+from db import SessionLocal
+from model import User, Podcast, UserPodcast, Episode, TranscriptStatus
 from auth import (
     get_password_hash,
     verify_password,
     create_access_token,
     decode_access_token,
 )
+
 import rss_handler
+from rss_handler import (
+    # These helpers make ingest consistent across quirky feeds.
+    # If your rss_handler doesn't expose some of these, remove them here
+    # and keep the inline logic below (the ingest still works).
+    extract_transcript_if_present,
+    get_guid,
+    get_pub_date,
+    get_audio_url,
+    get_duration_seconds,
+    get_image_url,
+)
 
 import summarizer
 
-
+# ─── Replicate Client ─────────────────────────────────────────────────────────
 replicate_client = replicate.Client(api_token=os.environ["REPLICATE_API_TOKEN"])
-
-
-
 
 # ─── Logger Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -32,7 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── User Management ─────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#                               USER MANAGEMENT
+# ─────────────────────────────────────────────────────────────────────────────
 
 def create_user(db: Session, email: str, password: str) -> User:
     """Registers a new user, hashing their password."""
@@ -47,7 +60,7 @@ def create_user(db: Session, email: str, password: str) -> User:
     logger.info(f"✅ Created user id={user.id}, email={email}")
     return user
 
-def authenticate_user(db: Session, email: str, password: str) -> str | None:
+def authenticate_user(db: Session, email: str, password: str) -> Optional[str]:
     """Verifies credentials and returns a JWT, or None if invalid."""
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
@@ -76,20 +89,18 @@ def get_current_user(db: Session, token: str) -> User:
     logger.info(f"✅ get_current_user: id={user.id}, email={user.email}")
     return user
 
-# ─── Subscription Management ─────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#                        SUBSCRIPTION / PODCASTS / EPISODES
+# ─────────────────────────────────────────────────────────────────────────────
 
-def get_user_podcasts(db: Session, user_id: int) -> list[Podcast]:
+def get_user_podcasts(db: Session, user_id: int) -> List[Podcast]:
     """Returns a list of Podcast objects the user is subscribed to."""
-    subs = (
-        db.query(UserPodcast)
-        .filter(UserPodcast.user_id == user_id)
-        .all()
-    )
+    subs = db.query(UserPodcast).filter(UserPodcast.user_id == user_id).all()
     podcasts = [sub.podcast for sub in subs]
     logger.info(f"✅ Retrieved {len(podcasts)} subscriptions for user_id={user_id}")
     return podcasts
 
-def subscribe_podcast(db: Session, user_id: int, feed_url: str, title: str | None = None) -> UserPodcast:
+def subscribe_podcast(db: Session, user_id: int, feed_url: str, title: Optional[str] = None) -> UserPodcast:
     """
     Subscribes a user to a podcast.
     Creates the Podcast record if it doesn't already exist.
@@ -102,11 +113,7 @@ def subscribe_podcast(db: Session, user_id: int, feed_url: str, title: str | Non
         db.refresh(podcast)
         logger.info(f"✅ Created Podcast id={podcast.id}, feed_url={feed_url}")
 
-    sub = (
-        db.query(UserPodcast)
-        .filter_by(user_id=user_id, podcast_id=podcast.id)
-        .first()
-    )
+    sub = db.query(UserPodcast).filter_by(user_id=user_id, podcast_id=podcast.id).first()
     if sub:
         logger.info(f"ℹ️  User {user_id} already subscribed to podcast {podcast.id}")
         return sub
@@ -120,11 +127,7 @@ def subscribe_podcast(db: Session, user_id: int, feed_url: str, title: str | Non
 
 def is_user_subscribed(db: Session, user_id: int, podcast_id: int) -> bool:
     """Returns True if the user has subscribed to the given podcast."""
-    count = (
-        db.query(UserPodcast)
-        .filter_by(user_id=user_id, podcast_id=podcast_id)
-        .count()
-    )
+    count = db.query(UserPodcast).filter_by(user_id=user_id, podcast_id=podcast_id).count()
     subscribed = count > 0
     logger.info(f"ℹ️  is_user_subscribed user_id={user_id}, podcast_id={podcast_id}: {subscribed}")
     return subscribed
@@ -135,7 +138,7 @@ def unsubscribe_podcast(db: Session, user_id: int, podcast_id: int) -> None:
     db.commit()
     logger.info(f"✅ Unsubscribed user_id={user_id} from podcast_id={podcast_id}")
 
-def list_episodes(db: Session, podcast_id: int) -> list[Episode]:
+def list_episodes(db: Session, podcast_id: int) -> List[Episode]:
     """
     Returns all Episode objects for the given podcast,
     ordered by publication date descending.
@@ -149,110 +152,208 @@ def list_episodes(db: Session, podcast_id: int) -> list[Episode]:
     logger.info(f"✅ Retrieved {len(episodes)} episodes for podcast_id={podcast_id}")
     return episodes
 
-# ─── Background & Polling ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#                         METADATA INGEST (NO TRANSCRIPTION)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_and_process_latest_async(podcast_id: int):
-    logger.info(f"▶️ fetch_and_process_latest_async: podcast_id={podcast_id}")
+def fetch_latest_metadata_async(podcast_id: int, limit: int = 10):
+    """
+    Background-friendly wrapper to ingest the latest N episodes' metadata (no transcription).
+    Call this after adding a podcast so the UI can show the newest 10 for user selection.
+    """
+    logger.info(f"▶️ fetch_latest_metadata_async: podcast_id={podcast_id}, limit={limit}")
     db = SessionLocal()
     try:
-        _fetch_and_process_latest(db, podcast_id, only_if_new=False)
+        ingest_latest_metadata(db, podcast_id, limit=limit)
     except Exception as e:
-        logger.error(f"❌ Async fetch_and_process_latest failed for podcast_id={podcast_id}: {e}")
+        logger.error(f"❌ Async metadata ingest failed for podcast_id={podcast_id}: {e}")
     finally:
         db.close()
 
-def sync_all_podcasts_async():
-    logger.info("▶️ sync_all_podcasts_async: scanning all podcasts")
+def sync_all_podcasts_metadata_async(limit: int = 10):
+    """
+    Periodic refresher for ALL podcasts—keeps the episode lists up-to-date (metadata only).
+    Useful to run hourly/daily via a scheduler so users always see the latest episodes.
+    """
+    logger.info("▶️ sync_all_podcasts_metadata_async: scanning all podcasts")
     db = SessionLocal()
     try:
         for p in db.query(Podcast).all():
             try:
-                _fetch_and_process_latest(db, p.id, only_if_new=True)
+                ingest_latest_metadata(db, p.id, limit=limit)
             except Exception as e:
-                logger.error(f"❌ Polling podcast {p.id} failed: {e}")
+                logger.error(f"❌ Metadata ingest for podcast {p.id} failed: {e}")
     finally:
         db.close()
 
-def _fetch_and_process_latest(
-    db: Session,
-    podcast_id: int,
-    only_if_new: bool = False
-) -> Episode | None:
-    logger.info(f"▶️ _fetch_and_process_latest: podcast_id={podcast_id}, only_if_new={only_if_new}")
+def ingest_latest_metadata(db: Session, podcast_id: int, limit: int = 10) -> List[Episode]:
+    """
+    Fetch RSS and UPSERT metadata for latest N episodes. No transcription here.
+    Populates: guid, title, pub_date, summary (short), audio_url, + optional duration/image/status.
+    """
+    logger.info(f"▶️ ingest_latest_metadata: podcast_id={podcast_id}, limit={limit}")
 
-    # 1) Load podcast record
     podcast = db.query(Podcast).get(podcast_id)
     if not podcast:
         logger.error(f"❌ Podcast not found id={podcast_id}")
-        return None
+        return []
 
-    # 2) Fetch & parse RSS
+    # Parse RSS (compatible with parse_feed returning a full feed or just entries)
     try:
-        entries = rss_handler.parse_feed(podcast.feed_url)
+        feed = rss_handler.parse_feed(podcast.feed_url)
+        entries = getattr(feed, "entries", feed)  # keeps backward compatibility
         logger.info(f"✅ RSS parsed ({len(entries)} entries) for feed={podcast.feed_url}")
     except Exception as e:
         logger.error(f"❌ RSS parsing failed for feed={podcast.feed_url}: {e}")
-        return None
+        return []
+
     if not entries:
         logger.warning(f"⚠️ No entries in feed {podcast.feed_url}")
-        return None
+        return []
 
-    latest = entries[0]
-    guid = latest.get("id") or latest.get("guid") or latest.get("link")
-    pub_dt = datetime(*latest.published_parsed[:6])
+    processed: List[Episode] = []
+    newest_dt: Optional[datetime] = None
 
-    # 3) Skip if already fetched
-    if only_if_new and podcast.last_fetched and podcast.last_fetched >= pub_dt:
-        logger.info(f"ℹ️ No new episode (last_fetched={podcast.last_fetched})")
-        return None
- # 4) Determine audio URL from enclosure (fallback to links)
-    if getattr(latest, "enclosures", None):
-        audio_url = latest.enclosures[0]["href"]
-    else:
-        audio_url = next(
-            (l["href"] for l in latest.get("links", [])
-             if l.get("type", "").startswith("audio")),
-            latest.get("link")
-        )
-    logger.info(f"ℹ️ Processing episode GUID={guid}, audio_url={audio_url}")
-    # 5) Transcription via Replicate
+    for entry in entries[:limit]:
+        # Use helper functions when available for robustness across feeds.
+        guid = get_guid(entry) or f"{podcast_id}:{entry.get('title','')}-{entry.get('published','')}"
+        pub_dt = get_pub_date(entry)  # tz-aware UTC if present
+        audio_url = get_audio_url(entry)
+        duration_seconds = get_duration_seconds(entry)
+        image_url = get_image_url(entry)
+
+        # UPSERT by (podcast_id, guid)
+        ep = db.query(Episode).filter_by(podcast_id=podcast_id, guid=guid).first()
+        if not ep:
+            ep = Episode(podcast_id=podcast_id, guid=guid)
+            db.add(ep)
+
+        ep.title = entry.get("title")
+        ep.pub_date = pub_dt
+        ep.summary = entry.get("summary") or entry.get("subtitle")  # short description
+        ep.audio_url = audio_url
+
+        # Optional extras (present if you ran the migration + model update)
+        if hasattr(Episode, "duration_seconds"):
+            ep.duration_seconds = duration_seconds
+        if hasattr(Episode, "image_url"):
+            ep.image_url = image_url
+
+        # If feed embeds a transcript, store it (free value), but still default to NOT_REQUESTED
+        try:
+            maybe_transcript = extract_transcript_if_present(entry)
+        except Exception:
+            maybe_transcript = None
+        if maybe_transcript and not ep.transcript:
+            ep.transcript = maybe_transcript
+
+        if hasattr(Episode, "transcript_status") and not ep.transcript:
+            ep.transcript_status = TranscriptStatus.NOT_REQUESTED
+
+        processed.append(ep)
+
+        if pub_dt and (newest_dt is None or pub_dt > newest_dt):
+            newest_dt = pub_dt
+
+    # Mark podcast-level last_fetched to the newest episode we saw
+    if newest_dt:
+        podcast.last_fetched = newest_dt
+
+    db.commit()
+    for ep in processed:
+        db.refresh(ep)
+
+    logger.info(f"✅ Ingested/updated {len(processed)} episodes (metadata only)")
+    return processed
+
+# ─────────────────────────────────────────────────────────────────────────────
+#                     TRANSCRIBE + SUMMARIZE (ON-DEMAND)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _summarize_safely(text: str, max_words: int = 500) -> str:
+    """
+    Handle either summarizer.summarize_with_openai(text, max_words=...)
+    or summarizer.summarize_with_openai(text) if your function doesn't take max_words.
+    """
     try:
-        words: list[dict] = replicate_client.run(
-            "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",  # ← replace with your model
-            input={"audio_url": audio_url}
+        return summarizer.summarize_with_openai(text, max_words=max_words)  # preferred
+    except TypeError:
+        return summarizer.summarize_with_openai(text)  # backward compatible
+
+def transcribe_and_summarize_episode_async(episode_id: int, summary_words: int = 500):
+    """
+    Background-friendly wrapper. If you add a proper task queue later (Celery/RQ),
+    call the sync function from the worker instead.
+    """
+    db = SessionLocal()
+    try:
+        transcribe_and_summarize_episode(db, episode_id, summary_words=summary_words)
+    except Exception as e:
+        logger.error(f"❌ Episode processing failed id={episode_id}: {e}")
+    finally:
+        db.close()
+
+def transcribe_and_summarize_episode(
+    db: Session,
+    episode_id: int,
+    summary_words: int = 500
+) -> Optional[Episode]:
+    """
+    Transcribes via Replicate using the episode's audio_url,
+    summarizes the transcript, and updates the SAME episode row.
+    """
+    ep = db.query(Episode).get(episode_id)
+    if not ep:
+        logger.error(f"❌ Episode not found id={episode_id}")
+        return None
+    if not ep.audio_url:
+        logger.error(f"❌ Episode {episode_id} has no audio_url")
+        return None
+
+    # Fast-path to avoid duplicate work (optional)
+    if getattr(ep, "transcript_status", None) == TranscriptStatus.COMPLETED and ep.transcript and ep.summary:
+        logger.info(f"ℹ️ Episode {episode_id} already COMPLETED; skipping.")
+        return ep
+
+    # Mark status -> TRANSCRIBING
+    if hasattr(Episode, "transcript_status"):
+        ep.transcript_status = TranscriptStatus.TRANSCRIBING
+        db.commit()
+
+    # --- Your Replicate call stays AS-IS ---
+    try:
+        logger.info(f"▶️ Replicate: transcribing episode_id={episode_id}")
+        words: List[dict] = replicate_client.run(
+            "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",
+            input={"audio_url": ep.audio_url}
         )
-        transcript = " ".join(w["text"] for w in words)
+        transcript_text = " ".join((w.get("text") or "").strip() for w in words).strip()
         logger.info("✅ Replicate transcription complete")
     except Exception as e:
-        logger.error(f"❌ Replicate transcription error for GUID={guid}: {e}")
+        logger.error(f"❌ Replicate transcription error for episode_id={episode_id}: {e}")
+        if hasattr(Episode, "transcript_status"):
+            ep.transcript_status = TranscriptStatus.FAILED
+            db.commit()
         return None
 
-    # 6) Summarization
+    # Summarize
     try:
-        summary = summarizer.summarize_with_openai(transcript)
+        summary_text = summarizer.summarize_with_openai(
+        transcript_text,
+        max_words=summary_words  # e.g., 800–1000 if you want longer
+       )
         logger.info("✅ Summarization complete")
     except Exception as e:
-        logger.error(f"❌ Summarization error for GUID={guid}: {e}")
-        summary = ""
+        logger.error(f"❌ Summarization error for episode_id={episode_id}: {e}")
+        summary_text = ""
 
-    # 7) Persist the new Episode
-    try:
-        ep = Episode(
-            podcast_id=podcast_id,
-            guid=guid,
-            title=latest.get("title"),
-            pub_date=pub_dt,
-            transcript=transcript,
-            summary=summary,
-            audio_url=audio_url
-        )
-        db.add(ep)
-        podcast.last_fetched = pub_dt
-        db.commit()
-        db.refresh(ep)
-        logger.info(f"✅ Episode saved id={ep.id}")
-        return ep
-    except Exception as e:
-        db.rollback()
-        logger.error(f"❌ DB save error for GUID={guid}: {e}")
-        return None
+    # Persist on SAME episode row
+    ep.transcript = transcript_text
+    ep.summary = summary_text
+    if hasattr(Episode, "transcript_status"):
+        ep.transcript_status = TranscriptStatus.COMPLETED
+
+    db.commit()
+    db.refresh(ep)
+    logger.info(f"✅ Episode updated id={ep.id} (transcript + summary)")
+    return ep
