@@ -1,7 +1,17 @@
-torch==2.1.1+cu118
-torchaudio==2.1.1+cu118
-faster-whisper==0.6.0
+# CUDA 12.1 builds of Torch
+torch==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/torch_stable.html
+torchaudio==2.3.1+cu121 --extra-index-url https://download.pytorch.org/whl/torch_stable.html
+torchvision==0.18.1+cu121 --extra-index-url https://download.pytorch.org/whl/torch_stable.html
 
-onnxruntime-gpu  # Explicitly use the GPU version to avoid conflicts
-requests==2.31.0
-huggingface-hub==0.16.4
+# ASR
+faster-whisper==1.0.3
+ctranslate2>=4.4.0
+
+# Diarization + HF
+
+huggingface_hub>=0.22.2
+
+# Audio utils
+librosa
+soundfile
+ffmpeg-python

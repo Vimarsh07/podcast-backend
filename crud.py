@@ -3,12 +3,9 @@ import os
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
-
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
-
 import replicate
-
 from db import SessionLocal
 from model import User, Podcast, UserPodcast, Episode, TranscriptStatus
 from auth import (
@@ -17,7 +14,6 @@ from auth import (
     create_access_token,
     decode_access_token,
 )
-
 import rss_handler
 from rss_handler import (
     extract_transcript_if_present,
@@ -27,7 +23,6 @@ from rss_handler import (
     get_duration_seconds,
     get_image_url,
 )
-
 import summarizer
 
 # ─── Replicate Client ─────────────────────────────────────────────────────────
@@ -302,7 +297,11 @@ def transcribe_and_summarize_episode_async(episode_id: int, summary_words: int =
         words: List[dict] = replicate_client.run(
             # keep your pinned model/version here
             "vimarsh07/podcast-transcriber:190a68e5493e182db5dbd2730e0ec8607c9db5da31a5883d73f14fb7c73cfe82",
-            input={"audio_url": _get_audio_url_for(episode_id)},
+            input={
+    "audio_url": "https://example.com/audio.mp3",
+    "hf_token": os.environ["HF_HUB_TOKEN"],  # kept in YOUR env, passed per request
+    
+  }
         )
         transcript_text = " ".join((w.get("text") or "").strip() for w in words).strip()
         logger.info("✅ Replicate transcription complete")
