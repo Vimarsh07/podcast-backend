@@ -6,6 +6,7 @@ import os
 import logging
 import socket
 from urllib.parse import urlparse
+from typing import List, Optional
 
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks
@@ -17,7 +18,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 import crud
 from db import SessionLocal, init_db
-from model import User, Podcast as PodcastModel,TranscriptStatus, Episode as EpisodeModel
+from model import (
+    User,
+    Podcast as PodcastModel,
+    TranscriptStatus,
+    TranscriptOrigin,             # <-- NEW
+    Episode as EpisodeModel,
+)
 
 # ─── Logging Configuration ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -75,7 +82,7 @@ class SubscribeRequest(BaseModel):
     feed_url: str
 
 class TranscribeRequest(BaseModel):
-    summary_words: int | None = 800
+    summary_words: Optional[int] = 800
     force: bool = False
 
 @app.get("/health", include_in_schema=False)
@@ -185,17 +192,74 @@ def unsubscribe_podcast(
     logger.info("✅ Unsubscribed")
 
 # ─── Episode Routes ─────────────────────────────────────────────────────────
+# --- replace your helper with this ---
+def _episode_selection(ep: EpisodeModel) -> dict:
+    """
+    Minimal payload for the selection/list view.
+    Show a plain-text metadata summary so the user can decide to transcribe.
+    """
+    return {
+        "id": ep.id,
+        "title": ep.title,
+        "pub_date": ep.pub_date.isoformat() if ep.pub_date else None,
+        "duration_seconds": ep.duration_seconds,
+        "image_url": ep.image_url,
+
+        # CHANGED: send the cleaned metadata summary (we store it in summary_html as plain text)
+        "meta_summary": (ep.summary_html or ""),
+
+        # pipeline state
+        "transcript_status": ep.transcript_status.value if ep.transcript_status else None,
+        "transcript_origin": (
+            ep.transcript_origin.value
+            if getattr(ep, "transcript_origin", None) else "NONE"
+        ),
+    }
+
+
+# --- replace your route with this ---
 @app.get("/episodes/{podcast_id}")
 def get_episodes(
     podcast_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user)
+    user: User = Depends(get_current_user),
 ):
-    logger.info(f"▶️ Listing episodes for podcast_id={podcast_id}")
+    logger.info(f"▶️ Listing episodes (selection view) for podcast_id={podcast_id}")
     if not crud.is_user_subscribed(db, user.id, podcast_id):
         logger.warning("⚠️ Access denied — not subscribed")
         raise HTTPException(status_code=403, detail="Not subscribed")
-    return crud.list_episodes(db, podcast_id)
+
+    eps = (
+        db.query(EpisodeModel)
+        .filter(EpisodeModel.podcast_id == podcast_id)
+        .order_by(EpisodeModel.pub_date.desc().nullslast())
+        .all()
+    )
+    # CHANGED: return objects with `meta_summary` instead of RSS flags
+    return [_episode_selection(ep) for ep in eps]
+
+
+
+@app.get("/episodes/{episode_id}/detail")
+def get_episode_detail(
+    episode_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    ep = db.query(EpisodeModel).get(episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    if not crud.is_user_subscribed(db, user.id, ep.podcast_id):
+        raise HTTPException(status_code=403, detail="Not subscribed")
+    # Return only what the UI needs
+    return {
+        "id": ep.id,
+        "summary": ep.summary,
+        "transcript": ep.transcript,
+        "transcript_status": ep.transcript_status.value if ep.transcript_status else None,
+        "transcript_origin": ep.transcript_origin.value if getattr(ep, "transcript_origin", None) else "NONE",
+    }
+
 
 @app.post("/podcasts/{podcast_id}/fetch-latest")
 def fetch_latest(
@@ -228,9 +292,17 @@ def transcribe_and_summarize(
     if not crud.is_user_subscribed(db, user.id, ep.podcast_id):
         raise HTTPException(status_code=403, detail="Not subscribed to this podcast")
 
-    # Skip if already fully done and not forcing
-    if not body.force and getattr(ep, "transcript", None) and getattr(ep, "summary", None):
+    # ✅ Skip ONLY if ASR truly completed (prevents metadata-polluted false positives)
+    if (
+        not body.force
+        and ep.transcript_status == TranscriptStatus.COMPLETED
+        and getattr(ep, "transcript_origin", TranscriptOrigin.NONE) == TranscriptOrigin.ASR
+    ):
         return {"message": "Already completed", "episode_id": episode_id}
+
+    # If already in progress, don’t enqueue again
+    if ep.transcript_status in (TranscriptStatus.QUEUED, TranscriptStatus.TRANSCRIBING):
+        raise HTTPException(status_code=409, detail="Transcription already in progress")
 
     # ✅ mark QUEUED and COMMIT before enqueueing
     if hasattr(ep, "transcript_status"):
